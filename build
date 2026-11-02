@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly platforms="linux/amd64,linux/arm64"
+readonly script_version="0.4.1"
+
+usage() {
+    cat <<'EOF'
+Build a configured image, self-contained .NET executable, or NuGet package.
+
+Usage:
+  build <target> [Docker options] [--config <path>]
+  build . [Docker options] [--config <path>]
+  build --init --kind <kind> [--kind <kind>]... [--config <path>]
+  build --list-kinds
+
+Shared options:
+  --config, -c <path>
+             Read or create a configuration file other than build.json.
+  --version  Print the build script version.
+  --help, -h Show this help text.
+
+Initialization options:
+  --init     Create example targets in a new configuration file; never overwrite one.
+  --kind <kind>
+             Include a complete example of this kind. Required with --init; may be repeated
+             for different kinds. Example targets are named example-<kind>.
+  --list-kinds
+             List supported kinds without a configuration file or build dependencies.
+
+Docker options:
+  --push     Build for linux/amd64 and linux/arm64, then push the image tags.
+  --load     Build for the Docker daemon's platform and load the image locally.
+  --no-cache Ignore cached Docker build layers without deleting them.
+  --build-secret <specification>
+             Forward one Buildx --secret specification. May be repeated.
+
+Examples:
+  build application --load
+  build . --push
+  build init
+  build --init --kind docker
+  build --init --kind dotnet --kind nuget
+  build --list-kinds
+
+Target names are positional arguments, including names such as init.
+The target "." is reserved for building all configured targets in configuration order.
+Builds run sequentially and stop on the first failure. Docker options apply only to Docker targets
+when building all targets; they are rejected for individual targets of other kinds.
+
+Docker targets use Buildx. Without --push or --load, the script validates a multi-platform build
+and leaves its result in the Buildx cache. Dotnet targets publish a self-contained, single-file
+executable. Their platforms default to the host platform when platforms is omitted or empty. NuGet
+targets pack their project into its configured output directory.
+
+Target definitions come from build.json in the working directory unless --config is given. Relative
+paths are resolved from the configuration file's directory. Docker targets require kind, image,
+project, and dockerfile; context defaults to the configuration directory. Dotnet and NuGet targets
+require kind, project, and output, while dotnet platforms are optional. Unknown fields and fields
+belonging to other kinds are rejected.
+
+Versions must be stable major.minor.patch values. Version 1.2.3 produces the tags 1.2.3, 1.2, 1,
+and latest for Docker targets. Pre-release versions are rejected.
+EOF
+}
+
+fail() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        fail "'$1' is required."
+    fi
+}
+
+read_required_value() {
+    local field="$1"
+    local value
+
+    value="$( jq -er \
+        --arg image "$image_key" \
+        --arg field "$field" \
+        '.[$image][$field] | select( type == "string" and length > 0 )' \
+        "$manifest" 2>/dev/null || true )"
+
+    if [[ -z "$value" ]]; then
+        fail "build.json entry '$image_key' requires a non-empty '$field' value."
+    fi
+
+    printf '%s\n' "$value"
+}
+
+read_context() {
+    local value
+
+    value="$( jq -er \
+        --arg image "$image_key" \
+        '.[$image].context // "." | select( type == "string" and length > 0 )' \
+        "$manifest" 2>/dev/null || true )"
+
+    if [[ -z "$value" ]]; then
+        fail "build.json entry '$image_key' has an invalid 'context' value."
+    fi
+
+    printf '%s\n' "$value"
+}
+
+read_kind() {
+    local value
+
+    value="$( jq -er \
+        --arg image "$image_key" \
+        '.[$image].kind | select( type == "string" and length > 0 )' \
+        "$manifest" 2>/dev/null || true )"
+
+    if [[ -z "$value" ]]; then
+        fail "build.json entry '$image_key' requires a non-empty 'kind' value."
+    fi
+
+    printf '%s\n' "$value"
+}
+
+read_dotnet_platforms() {
+    local value
+
+    value="$( jq -cer \
+        --arg image "$image_key" \
+        '.[$image].platforms // []
+         | select( type == "array" and all( .[]; type == "string" and length > 0 ) )' \
+        "$manifest" 2>/dev/null || true )"
+
+    if [[ -z "$value" ]]; then
+        fail "build.json dotnet entry '$image_key' has an invalid 'platforms' value."
+    fi
+
+    jq -r '.[]' <<< "$value"
+}
+
+read_version() {
+    local value
+
+    value="$( xmllint --xpath \
+        'normalize-space(/*[local-name()="Project"]/*[local-name()="PropertyGroup"]/*[local-name()="Version"][1])' \
+        "$project" 2>/dev/null || true )"
+
+    if [[ ! "$value" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        fail "project '$project' must explicitly define a stable major.minor.patch Version."
+    fi
+
+    printf '%s\n' "$value"
+}
+
+read_output_type() {
+    local value
+
+    value="$( xmllint --xpath \
+        'normalize-space(/*[local-name()="Project"]/*[local-name()="PropertyGroup"]/*[local-name()="OutputType"][1])' \
+        "$project" 2>/dev/null || true )"
+
+    if [[ "$value" != "Exe" ]]; then
+        fail "dotnet project '$project_path' must explicitly define <OutputType>Exe</OutputType>."
+    fi
+}
+
+host_platform() {
+    local architecture
+    local operating_system
+
+    case "$( uname -s )" in
+        Darwin)
+            operating_system="darwin"
+            ;;
+        Linux)
+            operating_system="linux"
+            ;;
+        *)
+            fail "dotnet target host operating system '$( uname -s )' is not supported."
+            ;;
+    esac
+
+    case "$( uname -m )" in
+        x86_64|amd64)
+            architecture="amd64"
+            ;;
+        arm64|aarch64)
+            architecture="arm64"
+            ;;
+        *)
+            fail "dotnet target host architecture '$( uname -m )' is not supported."
+            ;;
+    esac
+
+    printf '%s/%s\n' "$operating_system" "$architecture"
+}
+
+dotnet_runtime_identifier() {
+    case "$1" in
+        darwin/amd64)
+            printf 'osx-x64\n'
+            ;;
+        darwin/arm64)
+            printf 'osx-arm64\n'
+            ;;
+        linux/amd64)
+            printf 'linux-x64\n'
+            ;;
+        linux/arm64)
+            printf 'linux-arm64\n'
+            ;;
+        windows/amd64)
+            printf 'win-x64\n'
+            ;;
+        windows/arm64)
+            printf 'win-arm64\n'
+            ;;
+        *)
+            fail "dotnet target platform '$1' is not supported."
+            ;;
+    esac
+}
+
+read_load_platform() {
+    local daemon_platform
+    local architecture
+    local operating_system
+
+    daemon_platform="$( docker version --format '{{.Server.Os}}/{{.Server.Arch}}' )"
+    operating_system="${daemon_platform%%/*}"
+    architecture="${daemon_platform##*/}"
+
+    if [[ "$operating_system" != "linux" ]]; then
+        fail "--load requires a Linux Docker daemon, but found '$daemon_platform'."
+    fi
+
+    case "$architecture" in
+        amd64|x86_64)
+            architecture="amd64"
+            ;;
+        arm64|aarch64)
+            architecture="arm64"
+            ;;
+        *)
+            fail "--load does not support Docker daemon architecture '$architecture'."
+            ;;
+    esac
+
+    printf 'linux/%s\n' "$architecture"
+}
+
+working_directory="$( pwd -P )"
+configuration_path=""
+configuration_path_set=false
+
+resolve_manifest() {
+    local manifest_parent
+
+    if [[ "$configuration_path_set" == true ]]; then
+        if [[ "$configuration_path" == /* ]]; then
+            manifest="$configuration_path"
+        else
+            manifest="$working_directory/$configuration_path"
+        fi
+    else
+        manifest="$working_directory/build.json"
+    fi
+
+    manifest_parent="$( dirname -- "$manifest" )"
+
+    if [[ ! -d "$manifest_parent" ]]; then
+        fail "configuration directory '$manifest_parent' does not exist."
+    fi
+
+    configuration_directory="$( cd -- "$manifest_parent" && pwd -P )"
+    manifest="$configuration_directory/$( basename -- "$manifest" )"
+}
+
+list_kinds() {
+    cat <<'EOF'
+docker   Build a container image using Docker Buildx
+dotnet   Publish a self-contained .NET executable
+nuget    Pack a .NET project into a NuGet package
+EOF
+}
+
+validate_kind() {
+    case "$1" in
+        docker|dotnet|nuget) ;;
+        *) fail "unsupported kind '$1'. Use --list-kinds to see supported kinds." ;;
+    esac
+}
+
+docker_template() {
+    cat <<'EOF'
+{
+  "kind": "docker",
+  "project": "src/application/application.csproj",
+  "image": "registry.example.com/organization/application",
+  "dockerfile": "Dockerfile",
+  "context": "."
+}
+EOF
+}
+
+dotnet_template() {
+    cat <<'EOF'
+{
+  "kind": "dotnet",
+  "project": "src/application/application.csproj",
+  "output": "artifacts/application",
+  "platforms": ["linux/amd64", "linux/arm64"]
+}
+EOF
+}
+
+nuget_template() {
+    cat <<'EOF'
+{
+  "kind": "nuget",
+  "project": "src/library/library.csproj",
+  "output": "artifacts/packages"
+}
+EOF
+}
+
+initialize_manifest() {
+    local selected_kind
+    local template
+    local examples="{}"
+
+    if [[ -e "$manifest" || -L "$manifest" ]]; then
+        fail "build.json already exists at '$manifest'; refusing to overwrite it."
+    fi
+
+    require_command jq
+
+    for selected_kind in "${selected_kinds[@]}"; do
+        template="$( "${selected_kind}_template" )"
+        examples="$( jq --arg name "example-$selected_kind" --argjson template "$template" \
+            '. + {($name): $template}' <<< "$examples" )"
+    done
+
+    if ! ( set -o noclobber; printf '%s\n' "$examples" > "$manifest" ); then
+        fail "could not create configuration at '$manifest'; refusing to overwrite an existing file."
+    fi
+
+    printf 'Created sample build.json at %s\n' "$manifest"
+}
+
+validate_fields() {
+    local allowed_fields="$1"
+    local invalid_fields
+
+    invalid_fields="$( jq -r --arg image "$image_key" --argjson allowed "$allowed_fields" \
+        '.[$image] | keys - $allowed | join(", ")' "$manifest" )"
+
+    if [[ -n "$invalid_fields" ]]; then
+        fail "build.json $kind entry '$image_key' has unsupported fields: $invalid_fields."
+    fi
+}
+
+validate_docker() {
+    validate_fields '["kind", "project", "image", "dockerfile", "context"]'
+}
+
+validate_dotnet() {
+    validate_fields '["kind", "project", "output", "platforms"]'
+    validate_non_docker_options
+}
+
+validate_nuget() {
+    validate_fields '["kind", "project", "output"]'
+    validate_non_docker_options
+}
+
+validate_non_docker_options() {
+    if [[ "$mode" != "build" ]]; then
+        fail "--push and --load apply only to docker targets."
+    fi
+
+    if [[ "$no_cache" == true ]]; then
+        fail "--no-cache applies only to docker targets."
+    fi
+
+    if [[ "$build_secret_count" -gt 0 ]]; then
+        fail "--build-secret applies only to docker targets."
+    fi
+}
+
+build_docker() {
+    require_command docker
+
+    image="$( read_required_value image )"
+    dockerfile_path="$( read_required_value dockerfile )"
+    context_path="$( read_context )"
+    dockerfile="$configuration_directory/$dockerfile_path"
+    context="$configuration_directory/$context_path"
+
+    if [[ ! -f "$dockerfile" ]]; then
+        fail "dockerfile '$dockerfile_path' does not exist."
+    fi
+
+    if [[ ! -d "$context" ]]; then
+        fail "build context '$context_path' is not a directory."
+    fi
+
+    IFS='.' read -r major minor patch <<< "$version"
+    tags=( "$version" "$major.$minor" "$major" latest )
+    build_platforms="$platforms"
+    build_arguments=(
+        docker buildx build
+        --file "$dockerfile"
+        --platform "$build_platforms"
+    )
+
+    if [[ "$mode" == "push" ]]; then
+        build_arguments+=( --push )
+    elif [[ "$mode" == "load" ]]; then
+        build_platforms="$( read_load_platform )"
+        build_arguments=(
+            docker buildx build
+            --file "$dockerfile"
+            --platform "$build_platforms"
+            --load
+        )
+    fi
+
+    if [[ "$no_cache" == true ]]; then
+        build_arguments+=( --no-cache )
+    fi
+
+    if [[ "$build_secret_count" -gt 0 ]]; then
+        for build_secret in "${build_secrets[@]}"; do
+            build_arguments+=( --secret "$build_secret" )
+        done
+    fi
+
+    for tag in "${tags[@]}"; do
+        build_arguments+=( --tag "$image:$tag" )
+    done
+
+    build_arguments+=( "$context" )
+
+    printf 'Building %s for %s with tags:\n' "$image_key" "$build_platforms"
+    printf '  %s\n' "${tags[@]/#/$image:}"
+
+    exec "${build_arguments[@]}"
+}
+
+build_dotnet() {
+    require_command dotnet
+    read_output_type
+
+    output_path="$( read_required_value output )"
+    output="$configuration_directory/$output_path"
+    configured_platforms="$( read_dotnet_platforms )"
+
+    if [[ -n "$configured_platforms" ]]; then
+        target_platforms=()
+        while IFS= read -r target_platform; do
+            target_platforms+=( "$target_platform" )
+        done <<< "$configured_platforms"
+    else
+        target_platforms=()
+    fi
+
+    if [[ "${#target_platforms[@]}" -eq 0 ]]; then
+        target_platforms=( "$( host_platform )" )
+    fi
+
+    for target_platform in "${target_platforms[@]}"; do
+        runtime_identifier="$( dotnet_runtime_identifier "$target_platform" )"
+        platform_name="${target_platform//\//-}"
+        artifact_directory="$output/$platform_name"
+
+        printf 'Publishing %s for %s to %s\n' \
+            "$image_key" "$target_platform" "$artifact_directory"
+        dotnet publish "$project" \
+            --configuration Release \
+            --runtime "$runtime_identifier" \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:DebugType=None \
+            -p:DebugSymbols=false \
+            -p:GenerateDocumentationFile=false \
+            --output "$artifact_directory"
+    done
+}
+
+build_nuget() {
+    require_command dotnet
+
+    output_path="$( read_required_value output )"
+    output="$configuration_directory/$output_path"
+
+    printf 'Packing %s to %s\n' "$image_key" "$output"
+    dotnet pack "$project" \
+        --configuration Release \
+        --output "$output"
+}
+
+
+build_target() {
+    if ! jq -e --arg image "$image_key" '.[$image] | type == "object"' "$manifest" >/dev/null; then
+        fail "build.json has no object entry named '$image_key'."
+    fi
+
+    kind="$( read_kind )"
+    validate_kind "$kind"
+
+    if [[ "$build_all_targets" == true && "$kind" != "docker" ]]; then
+        mode="build"
+        no_cache=false
+        build_secrets=()
+        build_secret_count=0
+    fi
+
+    "validate_$kind"
+    project_path="$( read_required_value project )"
+    project="$configuration_directory/$project_path"
+
+    if [[ ! -f "$project" ]]; then
+        fail "project '$project_path' does not exist."
+    fi
+
+    version="$( read_version )"
+    "build_$kind"
+}
+
+build_all() (
+    completed_targets=0
+    total_targets="$( jq 'length' "$manifest" )"
+    current_target=""
+
+    trap 'build_status=$?; if [[ "$build_status" -ne 0 ]]; then
+        printf "Build failed for target %s (%s/%s targets completed).\n" \
+            "$current_target" "$completed_targets" "$total_targets" >&2
+    fi' EXIT
+
+    target_names="$( jq -c 'keys_unsorted' "$manifest" )"
+
+    while IFS= read -r -d '' image_key; do
+        current_target="$image_key"
+        printf '\nBuilding target %s (%s/%s)\n' \
+            "$image_key" "$(( completed_targets + 1 ))" "$total_targets"
+        ( build_target )
+        completed_targets=$(( completed_targets + 1 ))
+    done < <( jq -j '.[] | ., "\u0000"' <<< "$target_names" )
+
+    printf '\nBuilt all %s targets successfully.\n' "$completed_targets"
+)
+
+action="build"
+image_key=""
+selected_kinds=()
+selected_kind_count=0
+mode="build"
+no_cache=false
+build_secrets=()
+build_secret_count=0
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --init|--list-kinds|--version)
+            if [[ "$action" != "build" ]]; then
+                fail "choose only one management action: --init, --list-kinds, or --version."
+            fi
+
+            action="${1#--}"
+            ;;
+        --kind)
+            shift
+
+            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                fail "--kind requires a kind. Use --list-kinds to see supported kinds."
+            fi
+
+            validate_kind "$1"
+
+            if [[ "$selected_kind_count" -gt 0 ]]; then
+                for selected_kind in "${selected_kinds[@]}"; do
+                    if [[ "$selected_kind" == "$1" ]]; then
+                        fail "kind '$1' was selected more than once."
+                    fi
+                done
+            fi
+
+            selected_kinds+=( "$1" )
+            selected_kind_count=$(( selected_kind_count + 1 ))
+            ;;
+        --push|--load)
+            if [[ "$mode" != "build" ]]; then
+                fail "--push and --load cannot be repeated or used together."
+            fi
+
+            mode="${1#--}"
+            ;;
+        --no-cache)
+            if [[ "$no_cache" == true ]]; then
+                fail "--no-cache can only be used once."
+            fi
+
+            no_cache=true
+            ;;
+        --build-secret)
+            shift
+
+            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                fail "--build-secret requires a non-empty Buildx secret specification."
+            fi
+
+            build_secrets+=( "$1" )
+            build_secret_count=$(( build_secret_count + 1 ))
+            ;;
+        --config|-c)
+            if [[ "$configuration_path_set" == true ]]; then
+                fail "--config can only be used once."
+            fi
+
+            shift
+
+            if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                fail "--config requires a non-empty path."
+            fi
+
+            configuration_path="$1"
+            configuration_path_set=true
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        -*)
+            fail "unknown option '$1'. Use --help for usage."
+            ;;
+        *)
+            if [[ -n "$image_key" ]]; then
+                fail "only one target may be built at a time."
+            fi
+
+            image_key="$1"
+            ;;
+    esac
+
+    shift
+done
+
+if [[ "$action" != "build" ]]; then
+    if [[ -n "$image_key" || "$mode" != "build" || "$no_cache" == true || "$build_secret_count" -gt 0 ]]; then
+        fail "--$action cannot be combined with a target or Docker options."
+    fi
+fi
+
+if [[ "$action" != "init" && "$selected_kind_count" -gt 0 ]]; then
+    fail "--kind requires --init."
+fi
+
+case "$action" in
+    list-kinds|version)
+        if [[ "$configuration_path_set" == true ]]; then
+            fail "--$action does not accept --config."
+        fi
+
+        if [[ "$action" == "list-kinds" ]]; then
+            list_kinds
+        else
+            printf '%s\n' "$script_version"
+        fi
+
+        exit 0
+        ;;
+    init)
+        if [[ "$selected_kind_count" -eq 0 ]]; then
+            fail "--init requires at least one --kind. Use --list-kinds to see supported kinds."
+        fi
+
+        resolve_manifest
+        initialize_manifest
+        exit 0
+        ;;
+    build)
+        if [[ -z "$image_key" ]]; then
+            fail "a target is required. Use --help for usage."
+        fi
+        ;;
+esac
+
+resolve_manifest
+
+require_command jq
+require_command xmllint
+
+if [[ ! -f "$manifest" ]]; then
+    fail "missing build.json at '$manifest'."
+fi
+
+if ! jq -e 'type == "object"' "$manifest" >/dev/null; then
+    fail "build.json must contain an object of named targets."
+fi
+
+if jq -e 'has(".")' "$manifest" >/dev/null; then
+    fail "build.json target name '.' is reserved for building all targets."
+fi
+
+build_all_targets=false
+
+if [[ "$image_key" == "." ]]; then
+    build_all_targets=true
+
+    if [[ "$( jq 'length' "$manifest" )" -eq 0 ]]; then
+        fail "build.json has no targets to build."
+    fi
+
+    build_all
+else
+    build_target
+fi
