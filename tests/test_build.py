@@ -56,7 +56,7 @@ fi
     def test_management_without_build_dependencies(self):
         env = dict(self.env, PATH='/usr/bin:/bin')
         self.assertIn('docker', self.run_build('--list-kinds', env=env).stdout)
-        self.assertEqual(self.run_build('--version', env=env).stdout.strip(), '0.4.1')
+        self.assertEqual(self.run_build('--version', env=env).stdout.strip(), '0.5.0')
         self.assertIn('Initialization options:', self.run_build('--help', env=env).stdout)
         self.assertIn('Usage:', self.run_build(env=env).stdout)
 
@@ -145,6 +145,85 @@ fi
                 self.assertEqual(Path(call[-1]).resolve(), self.root)
                 for flag in flags:
                     self.assertIn(flag if flag != '--build-secret' else '--secret', call)
+
+    def test_configured_secrets_use_environment_without_exposing_values(self):
+        self.manifest('docker', secrets={'github_token': 'BUILD_TEST_TOKEN', 'other': 'BUILD_TEST_OTHER'})
+        env = dict(self.env, BUILD_TEST_TOKEN='private token,with=punctuation', BUILD_TEST_OTHER='other-private-value')
+        result = self.run_build('init', '--build-secret', 'id=extra,env=EXTRA_TOKEN', env=env)
+        call, = self.calls()
+        specs = [call[i + 1] for i, arg in enumerate(call) if arg == '--secret']
+        self.assertEqual(specs, ['id=extra,env=EXTRA_TOKEN', 'id=github_token,env=BUILD_TEST_TOKEN', 'id=other,env=BUILD_TEST_OTHER'])
+        for value in (env['BUILD_TEST_TOKEN'], env['BUILD_TEST_OTHER']):
+            self.assertNotIn(value, result.stdout + result.stderr + self.log.read_text())
+
+    def test_configured_secrets_require_nonempty_exported_variables(self):
+        self.manifest('docker', secrets={'github_token': 'BUILD_TEST_TOKEN'})
+        env = dict(self.env)
+        env.pop('BUILD_TEST_TOKEN', None)
+        for value in (None, ''):
+            with self.subTest(value=value):
+                if value is not None:
+                    env['BUILD_TEST_TOKEN'] = value
+                result = self.run_build('init', env=env, error="target 'init' requires environment variable 'BUILD_TEST_TOKEN' for secret 'github_token'")
+                self.assertNotIn('Building init', result.stdout)
+
+    def test_invalid_configured_secrets(self):
+        invalid = [None, False, [], 'TOKEN', {'': 'TOKEN'}, {'bad,id': 'TOKEN'},
+                   {'bad=id': 'TOKEN'}, {'bad\nname': 'TOKEN'}, {'id': ''}, {'id': None},
+                   {'id': 123}, {'id': 'BAD-NAME'}, {'id': '1TOKEN'}, {'id': 'TOKEN\n'}]
+        for secrets in invalid:
+            with self.subTest(secrets=secrets):
+                self.manifest('docker', secrets=secrets)
+                self.run_build('init', error="invalid 'secrets'")
+
+    def test_empty_configured_secrets(self):
+        self.manifest('docker', secrets={})
+        self.run_build('init')
+        call, = self.calls()
+        self.assertNotIn('--secret', call)
+
+    def test_duplicate_secret_ids(self):
+        self.manifest('docker', secrets={'github_token': 'BUILD_TEST_TOKEN'})
+        env = dict(self.env, BUILD_TEST_TOKEN='private-value')
+        for spec in ('id=github_token,env=OTHER', 'env=OTHER,id=github_token', 'type=env,ID=github_token', '"id=github_token",env=OTHER', 'src="unused",id=github_token'):
+            with self.subTest(spec=spec):
+                result = self.run_build('init', '--build-secret', spec, env=env,
+                                        error="duplicate secret ID 'github_token'")
+                self.assertNotIn('private-value', result.stdout + result.stderr)
+        self.manifest('docker')
+        self.run_build('init', '--build-secret', 'id=same,env=ONE', '--build-secret', 'id=same,env=TWO',
+                       error="duplicate secret ID 'same'")
+
+    def test_quoted_secret_source_does_not_create_false_duplicate(self):
+        self.manifest('docker', secrets={'github_token': 'BUILD_TEST_TOKEN'})
+        self.run_build('init', '--build-secret', 'id=other,"src=path,id=github_token"',
+                       env=dict(self.env, BUILD_TEST_TOKEN='private-value'))
+
+    def test_secrets_only_allowed_for_docker(self):
+        for kind in ('dotnet', 'nuget'):
+            with self.subTest(kind=kind):
+                self.manifest(kind, secrets={})
+                self.run_build('init', error='unsupported fields: secrets')
+
+    def test_all_preflights_secrets_before_any_builds(self):
+        targets = self.mixed_manifest()
+        targets['b-image'] = dict(targets['b-image'], secrets={'github_token': 'BUILD_TEST_TOKEN'})
+        (self.root / 'build.json').write_text(json.dumps(targets))
+        env = dict(self.env)
+        env.pop('BUILD_TEST_TOKEN', None)
+        self.run_build('.', env=env, error="target 'b-image' requires environment variable 'BUILD_TEST_TOKEN'")
+        self.run_build('.', '--build-secret', 'id=github_token,env=OTHER',
+                       env=dict(env, BUILD_TEST_TOKEN='private-value'), error="duplicate secret ID 'github_token'")
+
+    def test_all_configured_secrets_stay_with_owning_target(self):
+        targets = self.mixed_manifest()
+        targets['b-image'] = dict(targets['b-image'], secrets={'github_token': 'BUILD_TEST_TOKEN'})
+        (self.root / 'build.json').write_text(json.dumps(targets))
+        self.run_build('.', env=dict(self.env, BUILD_TEST_TOKEN='private-value'))
+        calls = self.calls()
+        for call in calls[:3]:
+            self.assertNotIn('--secret', call)
+        self.assertIn('id=github_token,env=BUILD_TEST_TOKEN', calls[3])
 
     def host_runtime(self):
         import platform

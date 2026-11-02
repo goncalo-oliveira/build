@@ -3,7 +3,7 @@
 set -euo pipefail
 
 readonly platforms="linux/amd64,linux/arm64"
-readonly script_version="0.4.1"
+readonly script_version="0.5.0"
 
 usage() {
     cat <<'EOF'
@@ -34,7 +34,7 @@ Docker options:
   --load     Build for the Docker daemon's platform and load the image locally.
   --no-cache Ignore cached Docker build layers without deleting them.
   --build-secret <specification>
-             Forward one Buildx --secret specification. May be repeated.
+             Add one Buildx --secret specification to configured secrets. May be repeated.
 
 Examples:
   build application --load
@@ -362,7 +362,69 @@ validate_fields() {
 }
 
 validate_docker() {
-    validate_fields '["kind", "project", "image", "dockerfile", "context"]'
+    validate_fields '["kind", "project", "image", "dockerfile", "context", "secrets"]'
+    validate_docker_secrets
+}
+
+validate_docker_secrets() {
+    local configured_secrets
+    local secret_id
+    local environment_name
+    local specification
+    local field
+    local seen_id
+    local seen_ids=()
+    local seen_count=0
+
+    configured_secrets="$( jq -c --arg image "$image_key" \
+        '.[$image] | if has("secrets") then .secrets else {} end' "$manifest" )"
+
+    if ! jq -e '
+        type == "object" and all( to_entries[];
+            (.key | test("^[A-Za-z0-9_.-]+\\z")) and
+            (.value | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*\\z"))
+        )' <<< "$configured_secrets" >/dev/null; then
+        fail "build.json docker entry '$image_key' has invalid 'secrets': expected an object mapping secret IDs (letters, digits, '.', '_', '-') to environment variable names."
+    fi
+
+    while IFS= read -r secret_id; do
+        environment_name="$( jq -r --arg id "$secret_id" '.[$id]' <<< "$configured_secrets" )"
+
+        if ! jq -en --arg name "$environment_name" \
+            'env[$name] | type == "string" and length > 0' >/dev/null; then
+            fail "target '$image_key' requires environment variable '$environment_name' for secret '$secret_id'."
+        fi
+
+        seen_ids+=( "$secret_id" )
+        seen_count=$(( seen_count + 1 ))
+    done < <( jq -r 'keys[]' <<< "$configured_secrets" )
+
+    if [[ "$build_secret_count" -gt 0 ]]; then
+        for specification in "${build_secrets[@]}"; do
+            # Buildx specifications use CSV, including quoted fields and escaped quotes.
+            while IFS= read -r -d '' field; do
+                case "$field" in
+                    [iI][dD]=*)
+                        secret_id="${field#*=}"
+
+                        if [[ "$seen_count" -gt 0 ]]; then
+                            for seen_id in "${seen_ids[@]}"; do
+                                if [[ "$secret_id" == "$seen_id" ]]; then
+                                    fail "target '$image_key' has duplicate secret ID '$secret_id' in --build-secret or configured secrets."
+                                fi
+                            done
+                        fi
+
+                        seen_ids+=( "$secret_id" )
+                        seen_count=$(( seen_count + 1 ))
+                        ;;
+                esac
+            done < <( jq -Rj '
+                scan("(?:^|,)(\"(?:[^\"]|\"\")*\"|[^\",]*)(?=,|$)") | .[0]
+                | if startswith("\"") then .[1:-1] | gsub("\"\""; "\"") else . end
+                | ., "\u0000"' <<< "$specification" )
+        done
+    fi
 }
 
 validate_dotnet() {
@@ -436,6 +498,11 @@ build_docker() {
             build_arguments+=( --secret "$build_secret" )
         done
     fi
+
+    while IFS= read -r configured_secret; do
+        build_arguments+=( --secret "$configured_secret" )
+    done < <( jq -r --arg image "$image_key" \
+        '.[$image].secrets // {} | to_entries[] | "id=\(.key),env=\(.value)"' "$manifest" )
 
     for tag in "${tags[@]}"; do
         build_arguments+=( --tag "$image:$tag" )
@@ -540,6 +607,14 @@ build_all() (
     fi' EXIT
 
     target_names="$( jq -c 'keys_unsorted' "$manifest" )"
+
+    # Check required credentials for every Docker target before starting any builds.
+    while IFS= read -r -d '' image_key; do
+        current_target="$image_key"
+        if jq -e --arg image "$image_key" '.[$image].kind == "docker"' "$manifest" >/dev/null; then
+            validate_docker_secrets
+        fi
+    done < <( jq -j '.[] | ., "\u0000"' <<< "$target_names" )
 
     while IFS= read -r -d '' image_key; do
         current_target="$image_key"

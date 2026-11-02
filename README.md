@@ -69,7 +69,7 @@ The script reads `build.json` from the working directory. Use `--config` (or `-c
 
 | Kind | Required fields | Optional fields |
 | --- | --- | --- |
-| `docker` | `kind`, `project`, `image`, `dockerfile` | `context` (defaults to `.`) |
+| `docker` | `kind`, `project`, `image`, `dockerfile` | `context` (defaults to `.`), `secrets` (secret ID to environment variable mapping) |
 | `dotnet` | `kind`, `project`, `output` | `platforms` (defaults to the host platform when omitted or empty) |
 | `nuget` | `kind`, `project`, `output` | — |
 
@@ -86,6 +86,33 @@ build application --build-secret id=token,env=BUILD_TOKEN
 ```
 
 Default and pushed builds target `linux/amd64` and `linux/arm64`. `--load` requires a Linux Docker daemon and targets its architecture. `--push` and `--load` are mutually exclusive. `--build-secret` may be repeated.
+
+Define required secrets on a Docker target to build with just `build application`:
+
+```json
+{
+  "application": {
+    "kind": "docker",
+    "project": "src/application/application.csproj",
+    "image": "registry.example.com/organization/application",
+    "dockerfile": "Dockerfile",
+    "secrets": {
+      "github_token": "GITHUB_TOKEN"
+    }
+  }
+}
+```
+
+Each key is the secret ID used in the Dockerfile; each value names an exported environment variable. IDs may contain letters, digits, `.`, `_`, and `-`. Environment variable names must start with a letter or `_` and contain only letters, digits, and `_`. Omit `secrets` or use `{}` when none are required.
+
+```sh
+export GITHUB_TOKEN  # After setting it in your shell
+build application
+```
+
+The script forwards this as `--secret id=github_token,env=GITHUB_TOKEN`. It stops before starting Docker if a required variable is unset or empty. For `build .`, all Docker targets' configured secrets are checked before any builds start. Store only variable names in `build.json`; secret values stay in the environment and are never printed or added to Docker command arguments.
+
+`--build-secret` can supply additional Buildx secret specifications. Duplicate IDs across configured and command-line secrets, or repeated command-line IDs, are rejected rather than overridden. Configured secrets belong only to their target and are not supported on .NET or NuGet targets.
 
 The project version supplies image tags: `1.2.3` produces `1.2.3`, `1.2`, `1`, and `latest`.
 
